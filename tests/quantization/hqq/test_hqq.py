@@ -13,12 +13,12 @@
 # limitations under the License.
 
 import gc
+import tempfile
 import unittest
-from unittest import skip
 
 import accelerate
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, HqqConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, HqqConfig, OPTConfig, OPTForCausalLM
 from transformers.testing_utils import (
     backend_empty_cache,
     require_accelerate,
@@ -102,11 +102,66 @@ class HqqConfigTest(unittest.TestCase):
         self.assertEqual(quantization_config.quant_config, hqq_orig_config["quant_config"])
 
 
+@require_hqq
+class HqqNestedCheckpointTest(unittest.TestCase):
+    def test_nested_checkpoint_load(self):
+        config = OPTConfig(
+            vocab_size=64,
+            hidden_size=16,
+            num_hidden_layers=1,
+            ffn_dim=32,
+            num_attention_heads=4,
+            max_position_embeddings=32,
+            word_embed_proj_dim=16,
+            tie_word_embeddings=False,
+        )
+        model = OPTForCausalLM(config).eval()
+        quantization_config = HqqConfig(nbits=4, group_size=8, skip_modules=["lm_head"])
+        model.config.quantization_config = quantization_config.to_dict()
+
+        for name, module in list(model.named_modules()):
+            if isinstance(module, torch.nn.Linear) and name != "lm_head":
+                parent_name, _, child_name = name.rpartition(".")
+                parent = model.get_submodule(parent_name) if parent_name else model
+                hqq_layer = HQQLinear(
+                    module,
+                    quant_config=quantization_config.quant_config,
+                    compute_dtype=torch.float16,
+                    device="cpu",
+                    del_orig=True,
+                )
+                if hqq_layer.bias is not None and isinstance(hqq_layer.bias, torch.Tensor):
+                    hqq_layer.bias = torch.nn.Parameter(hqq_layer.bias)
+                setattr(parent, child_name, hqq_layer)
+
+        nested_state_dict = {}
+        for name, module in model.named_modules():
+            if not name:
+                continue
+            state_dict = module.state_dict()
+            if state_dict:
+                nested_state_dict[name] = dict(state_dict)
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            model.config.save_pretrained(tmpdirname)
+            torch.save(nested_state_dict, f"{tmpdirname}/pytorch_model.bin")
+
+            model_loaded, info = AutoModelForCausalLM.from_pretrained(
+                tmpdirname,
+                output_loading_info=True,
+                weights_only=False,
+            )
+
+        self.assertIsInstance(model_loaded.model.decoder.layers[0].self_attn.q_proj, HQQLinear)
+        self.assertEqual(len(info["missing_keys"]), 0)
+        self.assertEqual(len(info["unexpected_keys"]), 0)
+        self.assertEqual(len(info["mismatched_keys"]), 0)
+
+
 @slow
 @require_torch_accelerator
 @require_accelerate
 @require_hqq
-@skip("skip for now until we add back support")
 class HQQTest(unittest.TestCase):
     def tearDown(self):
         cleanup()
@@ -164,7 +219,6 @@ class HQQTest(unittest.TestCase):
 @require_torch_multi_accelerator
 @require_accelerate
 @require_hqq
-@skip("skip for now until we add back support")
 class HQQTestMultiGPU(unittest.TestCase):
     def tearDown(self):
         cleanup()
@@ -188,7 +242,6 @@ class HQQTestMultiGPU(unittest.TestCase):
 @require_torch_accelerator
 @require_accelerate
 @require_hqq
-@skip("skip for now until we add back support")
 class HQQTestBias(unittest.TestCase):
     def tearDown(self):
         cleanup()
@@ -245,7 +298,6 @@ class HQQTestBias(unittest.TestCase):
 @require_torch_accelerator
 @require_accelerate
 @require_hqq
-@skip("skip for now until we add back support")
 class HQQSerializationTest(unittest.TestCase):
     def tearDown(self):
         cleanup()
