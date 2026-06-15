@@ -136,11 +136,12 @@ class HQQNestedCheckpointTest(unittest.TestCase):
 
             loaded_model, loading_info = LlamaForCausalLM.from_pretrained(
                 tmpdir,
-                dtype=torch.float32,
+                dtype=torch.float16,
                 output_loading_info=True,
             )
 
         self.assertIsInstance(loaded_model.model.layers[0].self_attn.q_proj, HQQLinear)
+        self.assertEqual(loaded_model.model.layers[0].self_attn.q_proj.compute_dtype, torch.float16)
         self.assertFalse(loading_info["missing_keys"])
         self.assertFalse(loading_info["unexpected_keys"])
 

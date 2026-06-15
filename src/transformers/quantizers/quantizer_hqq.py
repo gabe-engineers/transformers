@@ -398,7 +398,8 @@ class HqqHfQuantizer(HfQuantizer):
             if "W_q" not in state:
                 continue
 
-            hqq_layer = HQQLinear(None, None, compute_dtype=self.dtype or torch.float16, device="cpu", initialize=False)
+            compute_dtype = getattr(model, "dtype", None) or self.dtype or torch.float16
+            hqq_layer = HQQLinear(None, None, compute_dtype=compute_dtype, device="cpu", initialize=False)
             state["W_q"] = torch.nn.Parameter(state["W_q"], requires_grad=False)
             hqq_layer.load_state_dict(state)
 
