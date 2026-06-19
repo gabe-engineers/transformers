@@ -242,19 +242,134 @@ class HqqHfQuantizer(HfQuantizer):
         hqq_layer.forward = lambda x: forward_with_device(hqq_layer, x)
         return hqq_layer
 
+    def _setup_prequantized_key_filters(self, model, checkpoint_files):
+        import re
+
+        from safetensors import safe_open
+
+        from ..modeling_utils import load_state_dict
+
+        quantized_modules = set()
+        for checkpoint_file in checkpoint_files or []:
+            if checkpoint_file.endswith(".safetensors"):
+                with safe_open(checkpoint_file, framework="pt") as f:
+                    keys = f.keys()
+                    quantized_modules.update(key[: -len(".W_q")] for key in keys if key.endswith(".W_q"))
+            else:
+                state_dict = load_state_dict(checkpoint_file)
+                quantized_modules.update(key[: -len(".W_q")] for key in state_dict if key.endswith(".W_q"))
+
+        if not quantized_modules:
+            return
+
+        hqq_state_dict_keys = HQQLinear(None, None).state_dict_keys()
+        existing_unexpected = set(model._keys_to_ignore_on_load_unexpected or [])
+        model._keys_to_ignore_on_load_unexpected = existing_unexpected | {rf"\.{key}$" for key in hqq_state_dict_keys}
+
+        existing_missing = set(model._keys_to_ignore_on_load_missing or [])
+        model._keys_to_ignore_on_load_missing = existing_missing | {
+            re.escape(module_name) + r"\.weight" for module_name in quantized_modules
+        }
+
+        for module_name in quantized_modules:
+            try:
+                module = model.get_submodule(module_name)
+            except AttributeError:
+                continue
+            if hasattr(module, "weight") and module.weight is not None:
+                module.weight = torch.nn.Parameter(torch.empty(0, device="meta"), requires_grad=False)
+
     def _process_model_before_weight_loading(
         self,
         model: "PreTrainedModel",
+        checkpoint_files=None,
         **kwargs,
     ):
-        # Add the corresponding quant_config to each valid module. This allows us to do the actual nn.Linear -> HQQLinear conversion in create_quantized_param().
-        # prepare_for_hqq_linear() also sets the right quantization config inside the model (model.config.quantization_config) and the layers (hqq_layer.quant_config)
-        model = prepare_for_hqq_linear(model, quantization_config=self.quantization_config)
+        if self.pre_quantized:
+            self._checkpoint_files = checkpoint_files
+            self._setup_prequantized_key_filters(model, checkpoint_files)
+        else:
+            # Add the corresponding quant_config to each valid module. This allows us to do the actual nn.Linear -> HQQLinear conversion in create_quantized_param().
+            # prepare_for_hqq_linear() also sets the right quantization config inside the model (model.config.quantization_config) and the layers (hqq_layer.quant_config)
+            model = prepare_for_hqq_linear(model, quantization_config=self.quantization_config)
 
     def _process_model_after_weight_loading(self, model: "PreTrainedModel", **kwargs):
+        if self.pre_quantized:
+            self._load_hqq_from_checkpoint(model)
         setattr(model, "is_hqq_quantized", True)
         setattr(model, "is_hqq_serializable", self.is_serializable())
         return model
+
+    def _load_hqq_from_checkpoint(self, model: "PreTrainedModel"):
+        from collections import defaultdict
+
+        from safetensors import safe_open
+
+        from ..integrations.hqq import autoname_modules, name_to_linear_tag
+        from ..modeling_utils import load_state_dict
+
+        device_map = getattr(self, "device_map", None)
+        if isinstance(device_map, dict):
+            devices = [torch.device(device) for device in device_map.values()]
+            target_devices = [device for device in devices if device.type != "cpu"]
+            target_device = target_devices[0] if target_devices else torch.device("cpu")
+        elif isinstance(device_map, str) and device_map not in ("cpu", "auto"):
+            target_device = torch.device(device_map)
+        else:
+            target_device = torch.device("cpu")
+
+        autoname_modules(model)
+        skip_modules = self.quantization_config.skip_modules
+        hqq_state_dict_keys = HQQLinear(None, None).state_dict_keys()
+
+        quantizable_modules = {}
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                linear_tag = name_to_linear_tag(name)
+                if linear_tag not in skip_modules:
+                    quantizable_modules[name] = module
+
+        full_state_dict = {}
+        for checkpoint_file in self._checkpoint_files:
+            if checkpoint_file.endswith(".safetensors"):
+                with safe_open(checkpoint_file, framework="pt") as f:
+                    for key in f.keys():
+                        full_state_dict[key] = f.get_tensor(key)
+            else:
+                state_dict = load_state_dict(checkpoint_file)
+                full_state_dict.update(state_dict)
+
+        module_states = defaultdict(dict)
+        for key, value in full_state_dict.items():
+            for module_name in quantizable_modules:
+                if key.startswith(module_name + "."):
+                    param_name = key[len(module_name) + 1 :]
+                    if param_name in hqq_state_dict_keys:
+                        module_states[module_name][param_name] = value
+                    break
+
+        for module_name, state in module_states.items():
+            if "W_q" not in state:
+                continue
+
+            compute_dtype = getattr(model, "dtype", None) or self.dtype or torch.float16
+            hqq_layer = HQQLinear(None, None, compute_dtype=compute_dtype, device="cpu", initialize=False)
+            state["W_q"] = torch.nn.Parameter(state["W_q"], requires_grad=False)
+            hqq_layer.load_state_dict(state)
+
+            if target_device.type != "cpu":
+                hqq_layer.cuda(target_device)
+
+            if hqq_layer.bias is not None and isinstance(hqq_layer.bias, torch.Tensor):
+                hqq_layer.bias = torch.nn.Parameter(hqq_layer.bias)
+            if self.using_multi_gpu:
+                hqq_layer = self._patch_layer_for_multigpu(hqq_layer)
+
+            parent_name, _, child_name = module_name.rpartition(".")
+            parent = model.get_submodule(parent_name) if parent_name else model
+            setattr(parent, child_name, hqq_layer)
+
+        del full_state_dict
 
     def is_serializable(self):
         return True

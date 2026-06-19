@@ -67,6 +67,15 @@ class GenericTester(unittest.TestCase):
 
         self.assertEqual(flatten_dict(input_dict), expected_dict)
 
+    @require_torch
+    def test_flatten_dict_with_tensor_leaves(self):
+        input_dict = {"layer": {"weight": torch.tensor([1.0]), "bias": torch.tensor([2.0])}, "other": torch.tensor([3.0])}
+        flattened = flatten_dict(input_dict)
+
+        self.assertTrue(torch.equal(flattened["layer.weight"], torch.tensor([1.0])))
+        self.assertTrue(torch.equal(flattened["layer.bias"], torch.tensor([2.0])))
+        self.assertTrue(torch.equal(flattened["other"], torch.tensor([3.0])))
+
     def test_transpose_numpy(self):
         x = np.random.randn(3, 4)
         self.assertTrue(np.allclose(transpose(x), x.transpose()))

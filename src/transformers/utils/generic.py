@@ -622,7 +622,7 @@ def flatten_dict(d: MutableMapping, parent_key: str = "", delimiter: str = "."):
     def _flatten_dict(d, parent_key="", delimiter="."):
         for k, v in d.items():
             key = str(parent_key) + delimiter + str(k) if parent_key else k
-            if v and isinstance(v, MutableMapping):
+            if isinstance(v, MutableMapping) and v:
                 yield from flatten_dict(v, key, delimiter=delimiter).items()
             else:
                 yield key, v

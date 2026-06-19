@@ -13,12 +13,13 @@
 # limitations under the License.
 
 import gc
+import tempfile
 import unittest
 from unittest import skip
 
 import accelerate
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, HqqConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, HqqConfig, LlamaConfig, LlamaForCausalLM
 from transformers.testing_utils import (
     backend_empty_cache,
     require_accelerate,
@@ -100,6 +101,49 @@ class HqqConfigTest(unittest.TestCase):
         hqq_orig_config = quantization_config.to_dict()
 
         self.assertEqual(quantization_config.quant_config, hqq_orig_config["quant_config"])
+
+
+@require_hqq
+class HQQNestedCheckpointTest(unittest.TestCase):
+    def test_nested_checkpoint_load(self):
+        config = LlamaConfig(
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            vocab_size=32,
+        )
+        quantization_config = HqqConfig(nbits=4, group_size=8, skip_modules=["lm_head"])
+        config.quantization_config = quantization_config.to_dict()
+
+        model = LlamaForCausalLM(config)
+        linear = model.model.layers[0].self_attn.q_proj
+        hqq_layer = HQQLinear(
+            linear,
+            quantization_config.quant_config,
+            del_orig=False,
+            compute_dtype=torch.float32,
+            device="cpu",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config.save_pretrained(tmpdir)
+            state_dict = model.state_dict()
+            state_dict.pop("model.layers.0.self_attn.q_proj.weight")
+            state_dict["model.layers.0.self_attn.q_proj"] = dict(hqq_layer.state_dict())
+            torch.save(state_dict, f"{tmpdir}/pytorch_model.bin")
+
+            loaded_model, loading_info = LlamaForCausalLM.from_pretrained(
+                tmpdir,
+                dtype=torch.float16,
+                output_loading_info=True,
+            )
+
+        self.assertIsInstance(loaded_model.model.layers[0].self_attn.q_proj, HQQLinear)
+        self.assertEqual(loaded_model.model.layers[0].self_attn.q_proj.compute_dtype, torch.float16)
+        self.assertFalse(loading_info["missing_keys"])
+        self.assertFalse(loading_info["unexpected_keys"])
 
 
 @slow

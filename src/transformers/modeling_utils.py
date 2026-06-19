@@ -23,7 +23,7 @@ import sys
 import warnings
 from abc import abstractmethod
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, MutableMapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial, wraps
@@ -111,6 +111,7 @@ from .utils import (
     cached_file,
     check_torch_load_is_safe,
     copy_func,
+    flatten_dict,
     has_file,
     is_accelerate_available,
     is_bitsandbytes_available,
@@ -279,15 +280,25 @@ def get_state_dict_dtype(state_dict):
     """
     Returns the first found floating dtype in `state_dict` if there is one, otherwise returns the first dtype.
     """
-    for t in state_dict.values():
+    def _iter_leaf_tensors(value):
+        if isinstance(value, dict):
+            for nested_value in value.values():
+                yield from _iter_leaf_tensors(nested_value)
+        else:
+            yield value
+
+    first_tensor = None
+    for t in _iter_leaf_tensors(state_dict):
+        if first_tensor is None:
+            first_tensor = t
         # We cannot instantiate a whole model under float4/8_xxx dtypes (torch does not allow setting them as default dtype)
         if t.is_floating_point() and "float8_" not in str(t.dtype) and "float4_" not in str(t.dtype):
             return t.dtype
 
     # if no floating dtype was found return whatever the first dtype is
-    if len(state_dict) == 0:
+    if first_tensor is None:
         return torch.float32
-    return next(iter(state_dict.values())).dtype
+    return first_tensor.dtype
 
 
 str_to_torch_dtype = {
@@ -381,7 +392,10 @@ def load_state_dict(
     if map_location != "meta" and is_zipfile(checkpoint_path):
         extra_args = {"mmap": True}
 
-    return torch.load(checkpoint_path, map_location=map_location, weights_only=weights_only, **extra_args)
+    state_dict = torch.load(checkpoint_path, map_location=map_location, weights_only=weights_only, **extra_args)
+    if isinstance(state_dict, MutableMapping) and any(isinstance(value, MutableMapping) for value in state_dict.values()):
+        state_dict = flatten_dict(state_dict)
+    return state_dict
 
 
 def _end_ptr(tensor: torch.Tensor) -> int:
